@@ -489,6 +489,11 @@ footer > p {
   line-height: 1.7;
 }
 
+.post p code,
+.post li code {
+  overflow-wrap: anywhere;
+}
+
 .post blockquote {
   margin: 1.5rem 0;
   padding-left: 1.1rem;
@@ -510,11 +515,16 @@ footer > p {
   letter-spacing: 0.04em;
 }
 
+.post .table-scroll {
+  overflow-x: auto;
+  margin: 1.5rem 0;
+}
+
 .post table {
   width: 100%;
   border-collapse: collapse;
   font-size: 0.925rem;
-  margin: 1.5rem 0;
+  margin: 0;
 }
 
 .post th,
