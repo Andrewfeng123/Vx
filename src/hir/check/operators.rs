@@ -652,6 +652,7 @@ impl<'a> TypeChecker<'a> {
                     );
                     return Type::Unknown;
                 }
+                self.drops_note_operands(&[(inner, &inner_ty)]);
                 match op {
                     // Rust's rule: logical on a `bool`, bitwise on an integer, so the result has
                     // the operand's type. It used to be `bool` whatever the operand was, and each
