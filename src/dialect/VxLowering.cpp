@@ -1428,6 +1428,333 @@ static void promoteBufferCells(ModuleOp module) {
   });
 }
 
+// Where a buffer that a drop or a return names came from, under
+// VX_DROPS=scope (a module marked `vx.drops`).
+enum class BufferOrigin {
+  // A heap buffer this function owns: a `memref.alloc`, a tensor a call
+  // returned, or a parameter taken by value (`vx.owned`).
+  Heap,
+  // Storage a drop does not free: a stack slot, a global, a transfer's copy
+  // (placeTransferFrees frees it), or a parameter placed in another memory.
+  NotFreed,
+  // A view of another buffer, or a parameter taken by reference.
+  Borrowed,
+  Unknown,
+};
+
+// Whether parameter `i` of the function `call` reaches is taken by value.
+static bool takesOwnership(func::CallOp call, unsigned i) {
+  auto callee = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
+      call, call.getCalleeAttr());
+  return callee && callee.getArgAttr(i, "vx.owned");
+}
+
+static BufferOrigin originOf(Value v, llvm::SmallPtrSetImpl<void *> &seen);
+
+// The origin of every value in `values`, when they all have the same one.
+static BufferOrigin commonOrigin(ArrayRef<Value> values,
+                                 llvm::SmallPtrSetImpl<void *> &seen) {
+  std::optional<BufferOrigin> common;
+  for (Value v : values) {
+    // A value already being looked at, round a loop: the other paths decide.
+    if (seen.contains(v.getAsOpaquePointer()))
+      continue;
+    BufferOrigin o = originOf(v, seen);
+    if (common && *common != o)
+      return BufferOrigin::Unknown;
+    common = o;
+  }
+  return common.value_or(BufferOrigin::Unknown);
+}
+
+static BufferOrigin originOf(Value v, llvm::SmallPtrSetImpl<void *> &seen) {
+  while (auto cast = v.getDefiningOp<memref::CastOp>())
+    v = cast.getSource();
+  seen.insert(v.getAsOpaquePointer());
+  // The legacy code generator keeps a `let mut` tensor in a cell, a memref of
+  // memrefs: what is read back is one of the buffers stored into it.
+  if (auto load = v.getDefiningOp<memref::LoadOp>()) {
+    Value cell = load.getMemRef();
+    if (!cell.getDefiningOp<memref::AllocaOp>())
+      return BufferOrigin::Unknown;
+    SmallVector<Value> stored;
+    for (Operation *user : cell.getUsers()) {
+      if (auto store = dyn_cast<memref::StoreOp>(user)) {
+        if (store.getMemRef() != cell)
+          return BufferOrigin::Unknown;
+        stored.push_back(store.getValueToStore());
+      } else if (auto call = dyn_cast<func::CallOp>(user)) {
+        // `&t`, passed as a pointer to the cell: the function borrows it.
+        for (OpOperand &operand : call->getOpOperands())
+          if (operand.get() == cell &&
+              takesOwnership(call, operand.getOperandNumber()))
+            return BufferOrigin::Unknown;
+      } else if (!isa<memref::LoadOp>(user)) {
+        return BufferOrigin::Unknown; // the cell itself escapes
+      }
+    }
+    return commonOrigin(stored, seen);
+  }
+  if (auto arg = dyn_cast<BlockArgument>(v)) {
+    Block *block = arg.getOwner();
+    auto func = dyn_cast<func::FuncOp>(block->getParentOp());
+    if (func && !block->isEntryBlock()) {
+      // A value merged from the branches into this block.
+      SmallVector<Value> incoming;
+      for (auto it = block->pred_begin(); it != block->pred_end(); ++it) {
+        auto branch = dyn_cast<BranchOpInterface>((*it)->getTerminator());
+        if (!branch)
+          return BufferOrigin::Unknown;
+        SuccessorOperands forwarded =
+            branch.getSuccessorOperands(it.getSuccessorIndex());
+        if (forwarded.isOperandProduced(arg.getArgNumber()))
+          return BufferOrigin::Unknown;
+        incoming.push_back(forwarded[arg.getArgNumber()]);
+      }
+      return commonOrigin(incoming, seen);
+    }
+    if (!func)
+      return BufferOrigin::Unknown;
+    if (func.getArgAttr(arg.getArgNumber(), "vx.owned"))
+      return BufferOrigin::Heap;
+    if (func.getArgAttr(arg.getArgNumber(), "vx.placed"))
+      return BufferOrigin::NotFreed;
+    return BufferOrigin::Borrowed;
+  }
+  Operation *def = v.getDefiningOp();
+  if (isa<memref::AllocOp, func::CallOp>(def))
+    return BufferOrigin::Heap;
+  if (isa<memref::AllocaOp, memref::GetGlobalOp, vx::TransferOp>(def))
+    return BufferOrigin::NotFreed;
+  if (isa<ViewLikeOpInterface>(def))
+    return BufferOrigin::Borrowed;
+  return BufferOrigin::Unknown;
+}
+
+static BufferOrigin originOf(Value v) {
+  llvm::SmallPtrSet<void *, 8> seen;
+  return originOf(v, seen);
+}
+
+// A statically shaped result comes back in a stack slot the caller allocates
+// once, in its entry block. A function that takes it by value frees it, so a
+// result that is passed by value gets a heap buffer instead, allocated where
+// the call that fills it is.
+static LogicalResult giveMovedResultsHeapSlots(ModuleOp module) {
+  SmallVector<std::pair<func::CallOp, unsigned>> moves;
+  module.walk([&](func::CallOp call) {
+    for (unsigned i = 0; i < call.getNumOperands(); ++i)
+      if (takesOwnership(call, i))
+        moves.push_back({call, i});
+  });
+  for (auto [call, i] : moves) {
+    Value arg = call.getOperand(i);
+    while (auto cast = arg.getDefiningOp<memref::CastOp>())
+      arg = cast.getSource();
+    auto slot = arg.getDefiningOp<memref::AllocaOp>();
+    if (!slot)
+      continue; // checked by checkMovedArguments
+    // The call that fills the slot is the one that takes it first.
+    func::CallOp fill;
+    for (Operation *user : slot->getUsers())
+      if (auto c = dyn_cast<func::CallOp>(user); c && c.getNumOperands() > 0 &&
+                                                 c.getOperand(0) == slot &&
+                                                 c.getNumResults() == 0)
+        fill = c;
+    if (!fill)
+      return call.emitError("a stack buffer that no call returned into is "
+                            "passed by value");
+    DominanceInfo dominance(fill->getParentOfType<func::FuncOp>());
+    for (Operation *user : slot->getUsers())
+      if (user != fill && !dominance.properlyDominates(fill, user))
+        return user->emitError("a result slot is used before the call that "
+                               "fills it");
+    OpBuilder builder(fill);
+    auto heap = memref::AllocOp::create(builder, slot.getLoc(), slot.getType());
+    slot.replaceAllUsesWith(heap.getResult());
+    slot.erase();
+  }
+  return success();
+}
+
+// Every tensor passed by value must be a heap buffer: the function that takes
+// it frees it.
+static LogicalResult checkMovedArguments(ModuleOp module) {
+  LogicalResult result = success();
+  module.walk([&](func::CallOp call) {
+    for (unsigned i = 0; i < call.getNumOperands(); ++i)
+      if (takesOwnership(call, i) &&
+          originOf(call.getOperand(i)) != BufferOrigin::Heap) {
+        call.emitError("argument ")
+            << i << " is passed by value but is not a heap buffer this "
+            << "function owns";
+        result = failure();
+      }
+  });
+  return result;
+}
+
+// A function returns a `?`-shaped tensor by handing back a buffer, which its
+// caller then owns and frees. One that returns a view, or a parameter it only
+// borrows, returns a copy instead.
+static LogicalResult returnOwnedBuffers(ModuleOp module) {
+  LogicalResult result = success();
+  module.walk([&](func::ReturnOp ret) {
+    for (OpOperand &operand : ret->getOpOperands()) {
+      auto type = dyn_cast<MemRefType>(operand.get().getType());
+      // A tensor placed in another memory is left as it was.
+      if (!type || type.getMemorySpace())
+        continue;
+      BufferOrigin origin = originOf(operand.get());
+      if (origin == BufferOrigin::Heap)
+        continue;
+      if (origin == BufferOrigin::Unknown) {
+        ret.emitError("returns a buffer whose origin is not known");
+        result = failure();
+        continue;
+      }
+      OpBuilder builder(ret);
+      Location loc = ret.getLoc();
+      SmallVector<Value> sizes;
+      for (int64_t d = 0; d < type.getRank(); ++d)
+        if (type.isDynamicDim(d))
+          sizes.push_back(
+              memref::DimOp::create(builder, loc, operand.get(), d));
+      auto copy = memref::AllocOp::create(
+          builder, loc, MemRefType::get(type.getShape(), type.getElementType()),
+          sizes);
+      memref::CopyOp::create(builder, loc, operand.get(), copy);
+      Value owned = copy.getResult();
+      if (owned.getType() != type)
+        owned = memref::CastOp::create(builder, loc, type, owned);
+      operand.set(owned);
+    }
+  });
+  return result;
+}
+
+// Turn each `vx.drop` into a `memref.dealloc` of a heap buffer this function
+// owns, guarded by its moved flag when it has one. A drop of storage nobody
+// frees is erased. So is a drop inside a `vx.spawn`: freeing inside device
+// regions is not done yet.
+static LogicalResult lowerDrops(ModuleOp module) {
+  SmallVector<vx::DropOp> drops;
+  module.walk([&](vx::DropOp d) { drops.push_back(d); });
+  for (vx::DropOp d : drops) {
+    BufferOrigin origin = originOf(d.getBuffer());
+    if (d.getOwnedOnly() && origin != BufferOrigin::Heap)
+      origin = BufferOrigin::NotFreed;
+    if (origin == BufferOrigin::Unknown)
+      return d.emitError("vx.drop of a buffer whose origin is not known");
+    if (origin == BufferOrigin::Borrowed)
+      return d.emitError("vx.drop of a buffer this function does not own");
+    // Placed memory and device regions are not freed by drops yet.
+    auto type = dyn_cast<MemRefType>(d.getBuffer().getType());
+    if (origin != BufferOrigin::Heap || d->getParentOfType<vx::SpawnOp>() ||
+        !type || type.getMemorySpace()) {
+      d.erase();
+      continue;
+    }
+    OpBuilder builder(d);
+    Location loc = d.getLoc();
+    if (Value moved = d.getMoved()) {
+      Value yes = arith::ConstantIntOp::create(builder, loc, 1, 1);
+      Value notMoved = arith::XOrIOp::create(builder, loc, moved, yes);
+      auto ifOp = scf::IfOp::create(builder, loc, notMoved);
+      builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
+    }
+    memref::DeallocOp::create(builder, loc, d.getBuffer());
+    d.erase();
+  }
+  return success();
+}
+
+// A fresh heap buffer that no drop names and that nothing takes is a
+// temporary: `g()` in `f(&g())`. It is freed after its last use, when every
+// use is in the block that made it; anywhere else it is left unfreed. An owner
+// always has a drop or is taken, so this frees no owner.
+static void freeTemporaries(ModuleOp module) {
+  SmallVector<Value> fresh;
+  module.walk([&](Operation *op) {
+    if (!op->getParentOfType<func::FuncOp>() ||
+        op->getParentOfType<vx::SpawnOp>())
+      return;
+    if (isa<memref::AllocOp>(op) || isa<func::CallOp>(op))
+      for (Value r : op->getResults())
+        if (auto type = dyn_cast<MemRefType>(r.getType());
+            type && !type.getMemorySpace())
+          fresh.push_back(r);
+  });
+  for (Value buffer : fresh) {
+    Block *home = buffer.getParentBlock();
+    SmallVector<Value> aliases{buffer};
+    Operation *last = buffer.getDefiningOp();
+    bool keep = false;
+    for (size_t i = 0; i < aliases.size() && !keep; ++i) {
+      for (OpOperand &use : aliases[i].getUses()) {
+        Operation *user = use.getOwner();
+        Operation *here = home->findAncestorOpInBlock(*user);
+        // A drop frees it, or code written by hand (an `mlir!` block) already
+        // does.
+        if (!here || isa<vx::DropOp, memref::DeallocOp>(user) ||
+            user->getParentOfType<vx::SpawnOp>()) {
+          keep = true;
+          break;
+        }
+        auto store = dyn_cast<memref::StoreOp>(user);
+        if (auto view = dyn_cast<ViewLikeOpInterface>(user);
+            view && view.getViewSource() == aliases[i]) {
+          aliases.push_back(user->getResult(0));
+        } else if (auto load = dyn_cast<memref::LoadOp>(user);
+                   load && load.getMemRef() == aliases[i] &&
+                   isa<MemRefType>(load.getType())) {
+          // A read of the cell below: the buffer again.
+          aliases.push_back(load.getResult());
+        } else if (store && store.getValueToStore() == aliases[i]) {
+          // The legacy code generator passes `&t` as a pointer to a cell
+          // holding the buffer. A local cell stored into once is another name
+          // for it; anything else keeps it.
+          Value cell = store.getMemRef();
+          keep = !cell.getDefiningOp<memref::AllocaOp>() ||
+                 llvm::count_if(cell.getUsers(), [](Operation *u) {
+                   return isa<memref::StoreOp>(u);
+                 }) != 1;
+          if (!keep)
+            aliases.push_back(cell);
+        } else if (auto call = dyn_cast<func::CallOp>(user)) {
+          keep = takesOwnership(call, use.getOperandNumber());
+        } else if (isa<func::ReturnOp, BranchOpInterface,
+                       RegionBranchTerminatorOpInterface,
+                       memref::ExtractAlignedPointerAsIndexOp,
+                       UnrealizedConversionCastOp>(user) ||
+                   user->getDialect()->getNamespace() == "vx" ||
+                   user->getDialect()->getNamespace() == "llvm") {
+          keep = true;
+        }
+        if (keep)
+          break;
+        if (last->isBeforeInBlock(here))
+          last = here;
+      }
+    }
+    if (keep || last->hasTrait<OpTrait::IsTerminator>())
+      continue;
+    OpBuilder builder(last->getContext());
+    builder.setInsertionPointAfter(last);
+    memref::DeallocOp::create(builder, last->getLoc(), buffer);
+  }
+}
+
+static LogicalResult placeDrops(ModuleOp module) {
+  if (!module->hasAttr("vx.drops"))
+    return success();
+  if (failed(giveMovedResultsHeapSlots(module)) ||
+      failed(checkMovedArguments(module)) || failed(returnOwnedBuffers(module)))
+    return failure();
+  freeTemporaries(module);
+  return lowerDrops(module);
+}
+
 struct ConvertVxToStandardPass
     : public PassWrapper<ConvertVxToStandardPass, OperationPass<ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ConvertVxToStandardPass)
@@ -1441,9 +1768,10 @@ struct ConvertVxToStandardPass
   }
 
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<async::AsyncDialect, cf::ControlFlowDialect,
-                    func::FuncDialect, memref::MemRefDialect,
-                    arith::ArithDialect, gpu::GPUDialect, math::MathDialect>();
+    registry
+        .insert<async::AsyncDialect, cf::ControlFlowDialect, func::FuncDialect,
+                memref::MemRefDialect, arith::ArithDialect, gpu::GPUDialect,
+                math::MathDialect, scf::SCFDialect>();
   }
 
   /// Give every device kernel a `gpu.func` beside its `vx.kernel`.
@@ -1879,6 +2207,12 @@ struct ConvertVxToStandardPass
 
     placeTransferFrees(getOperation());
     promoteBufferCells(getOperation());
+    // After the cells are promoted, so that most buffers a drop names are
+    // plain values again.
+    if (failed(placeDrops(getOperation()))) {
+      signalPassFailure();
+      return;
+    }
 
     RewritePatternSet patterns(&getContext());
     patterns.add<SpawnOpLowering, TransferOpLowering>(&getContext());
@@ -3032,10 +3366,62 @@ struct PromoteBuffersToStackPass
     return reason;
   }
 
+  // Under drops a heap buffer has a `memref.dealloc`, which upstream promotion
+  // refuses, and a buffer passed by value is freed by the function that takes
+  // it, which upstream promotion does not know. So a small buffer is promoted
+  // here when nothing takes it by value, returns it or branches with it, and
+  // its deallocs are erased.
+  static void promoteOwnedBuffers(func::FuncOp func) {
+    SmallVector<memref::AllocOp> allocs;
+    func.walk([&](memref::AllocOp a) { allocs.push_back(a); });
+    for (memref::AllocOp alloc : allocs) {
+      MemRefType type = alloc.getType();
+      if (!type.hasStaticShape() || !type.getLayout().isIdentity() ||
+          !type.getElementType().isIntOrIndexOrFloat())
+        continue;
+      int64_t bits =
+          type.getNumElements() * type.getElementType().getIntOrFloatBitWidth();
+      if (bits > 4096 * 8)
+        continue;
+      SmallVector<Value> aliases{alloc.getResult()};
+      SmallVector<memref::DeallocOp> deallocs;
+      bool escapes = false;
+      for (size_t i = 0; i < aliases.size() && !escapes; ++i) {
+        for (OpOperand &use : aliases[i].getUses()) {
+          Operation *user = use.getOwner();
+          if (auto view = dyn_cast<ViewLikeOpInterface>(user);
+              view && view.getViewSource() == aliases[i]) {
+            aliases.push_back(user->getResult(0));
+          } else if (auto d = dyn_cast<memref::DeallocOp>(user)) {
+            deallocs.push_back(d);
+          } else if (auto call = dyn_cast<func::CallOp>(user)) {
+            escapes |= takesOwnership(call, use.getOperandNumber());
+          } else if (isa<func::ReturnOp, BranchOpInterface,
+                         memref::ExtractAlignedPointerAsIndexOp>(user)) {
+            escapes = true;
+          }
+        }
+      }
+      if (escapes)
+        continue;
+      OpBuilder builder(alloc);
+      auto alloca = memref::AllocaOp::create(builder, alloc.getLoc(), type,
+                                             alloc.getAlignmentAttr());
+      alloc.replaceAllUsesWith(alloca.getResult());
+      alloc.erase();
+      for (memref::DeallocOp d : deallocs)
+        d.erase();
+    }
+  }
+
   void runOnOperation() override {
     func::FuncOp func = getOperation();
     if (reasonToKeepOnHeap(func))
       return;
+    if (func->getParentOfType<ModuleOp>()->hasAttr("vx.drops")) {
+      promoteOwnedBuffers(func);
+      return;
+    }
     OpPassManager pm(func::FuncOp::getOperationName());
     if (failed(parsePassPipeline(
             "promote-buffers-to-stack{max-alloc-size-in-bytes=4096}", pm))) {
@@ -3271,6 +3657,8 @@ struct FreeHeapBuffersPass
 
   // Why this module has to be left alone, or null if it does not.
   static const char *reasonToSkip(ModuleOp module) {
+    if (module->hasAttr("vx.drops"))
+      return "the program frees its tensors at their drops";
     const char *reason = nullptr;
     auto holdsBuffer = [](Type type) {
       auto cell = llvm::dyn_cast<MemRefType>(type);
