@@ -114,10 +114,6 @@ pub struct MeliorGenerator<'c> {
     pub(crate) f16_ty: Type<'c>,
     pub(crate) bf16_ty: Type<'c>,
     pub(crate) i1_ty: Type<'c>,
-    pub(crate) i4_ty: Type<'c>,
-    pub(crate) i8_ty: Type<'c>,
-    pub(crate) i16_ty: Type<'c>,
-    pub(crate) i128_ty: Type<'c>,
     pub(crate) ptr_ty: Type<'c>,
     pub(crate) none_ty: Type<'c>,
     /// Whether to transport host-proven `assert` facts across a device `spawn` seam as
@@ -721,10 +717,6 @@ impl<'c> MeliorGenerator<'c> {
         let f16_ty = Type::parse(context, "f16").unwrap();
         let bf16_ty = Type::parse(context, "bf16").unwrap();
         let i1_ty = Type::parse(context, "i1").unwrap();
-        let i4_ty = Type::parse(context, "i4").unwrap();
-        let i8_ty = Type::parse(context, "i8").unwrap();
-        let i16_ty = Type::parse(context, "i16").unwrap();
-        let i128_ty = Type::parse(context, "i128").unwrap();
         let ptr_ty = Type::parse(context, "!llvm.ptr").unwrap();
         let none_ty = Type::parse(context, "none").unwrap();
 
@@ -776,10 +768,6 @@ impl<'c> MeliorGenerator<'c> {
             f16_ty,
             bf16_ty,
             i1_ty,
-            i4_ty,
-            i8_ty,
-            i16_ty,
-            i128_ty,
             ptr_ty,
             none_ty,
             emit_seam_certs: false,
@@ -1754,6 +1742,42 @@ impl<'c> MeliorGenerator<'c> {
         })
     }
 
+    /// An instantiated generic enum (its name holds `<...>`): a tag and the payload slot.
+    fn generic_enum_type(
+        &self,
+        name: &str,
+        enum_def: &[(crate::symbol::Symbol, Option<Vec<syntax::Type>>)],
+    ) -> Result<Type<'c>, LowerError> {
+        let payload_ty_str = self.enum_payload_slot_ty(enum_def, None)?;
+        Type::parse(
+            self.context,
+            &format!("!llvm.struct<\"{}\", (i32, {})>", name, payload_ty_str),
+        )
+        .ok_or_else(|| LowerError::from("failed to parse Option enum layout".to_string()))
+    }
+
+    /// The type arguments of a generic instance, joined into a name that is safe inside a
+    /// struct name: `[i32, f32]` becomes `i32_f32`.
+    fn type_args_name(&self, args: &[syntax::Type]) -> Result<String, LowerError> {
+        let names = args
+            .iter()
+            .map(|a| {
+                let lowered = self.lower_type_str(a)?;
+                Ok(lowered
+                    .replace("!", "")
+                    .replace("<", "_")
+                    .replace(">", "_")
+                    .replace(" ", "_")
+                    .replace(",", "_")
+                    .replace("\"", "")
+                    .replace("(", "_")
+                    .replace(")", "_")
+                    .replace(".", "_"))
+            })
+            .collect::<Result<Vec<_>, LowerError>>()?;
+        Ok(names.join("_"))
+    }
+
     pub(crate) fn lower_type(
         &self,
         ty: &syntax::Type,
@@ -1763,32 +1787,9 @@ impl<'c> MeliorGenerator<'c> {
                 return self.lower_tensor_type(el_ty, dims, top);
             }
             syntax::Type::Scalar(el_ty) => {
-                return Ok(match el_ty {
-                    ElementType::F16 => self.f16_ty,
-                    ElementType::F32 => self.f32_ty,
-                    ElementType::F64 => self.f64_ty,
-                    ElementType::BF16 => self.bf16_ty,
-                    ElementType::I32 | ElementType::U32 => self.i32_ty,
-                    ElementType::I64 | ElementType::U64 | ElementType::USize => self.i64_ty,
-                    ElementType::I4 | ElementType::U4 => self.i4_ty,
-                    ElementType::I8 | ElementType::U8 => self.i8_ty,
-                    ElementType::I16 | ElementType::U16 => self.i16_ty,
-                    ElementType::I128 | ElementType::U128 => self.i128_ty,
-                    ElementType::Bool => self.i1_ty,
-                    ElementType::F8E4M3 | ElementType::F8E5M2 | ElementType::F4E2M1 => {
-                        return Err(LowerError::from(
-                            "sub-8-bit float element types are capacity/declaration-only; \
-                             their codegen is not implemented"
-                                .to_string(),
-                        ));
-                    }
-                    ElementType::Generic(_) => {
-                        return Err(LowerError::from(
-                            "internal: generic element type reached codegen (monomorphization \
-                             should have instantiated it)"
-                                .to_string(),
-                        ));
-                    }
+                let name = element_mlir(el_ty)?;
+                return Type::parse(self.context, name).ok_or_else(|| {
+                    LowerError::from(format!("failed to parse MLIR element type `{name}`"))
                 });
             }
             syntax::Type::Matrix => {
@@ -1837,14 +1838,7 @@ impl<'c> MeliorGenerator<'c> {
                     // Any instantiated generic enum, and whichever of its variants carries
                     // the payload -- not a type called `Option` with a variant called `Some`.
                     if name.contains('<') {
-                        let payload_ty_str = self.enum_payload_slot_ty(enum_def, None)?;
-                        return Type::parse(
-                            self.context,
-                            &format!("!llvm.struct<\"{}\", (i32, {})>", name, payload_ty_str),
-                        )
-                        .ok_or_else(|| {
-                            LowerError::from("failed to parse Option enum layout".to_string())
-                        });
+                        return self.generic_enum_type(name, enum_def);
                     }
                     return Ok(self.i32_ty);
                 }
@@ -1898,26 +1892,11 @@ impl<'c> MeliorGenerator<'c> {
                         for (_, ty) in &decl.fields {
                             field_types.push(self.field_type_str(&ty.substitute(&mapping))?);
                         }
-                        let args_str: Vec<String> = args
-                            .iter()
-                            .map(|a| {
-                                let lowered = self.lower_type_str(a)?;
-                                Ok(lowered
-                                    .replace("!", "")
-                                    .replace("<", "_")
-                                    .replace(">", "_")
-                                    .replace(" ", "_")
-                                    .replace(",", "_")
-                                    .replace("\"", "")
-                                    .replace("(", "_")
-                                    .replace(")", "_")
-                                    .replace(".", "_"))
-                            })
-                            .collect::<Result<Vec<_>, LowerError>>()?;
+                        let args_str = self.type_args_name(args)?;
                         format!(
                             "!llvm.struct<\"{}_{}\", ({})>",
                             name,
-                            args_str.join("_"),
+                            args_str,
                             field_types.join(", ")
                         )
                     } else if let Some(enum_def) = self.enums.get(name).cloned() {
@@ -1950,28 +1929,11 @@ impl<'c> MeliorGenerator<'c> {
                         let payload_ty_str =
                             self.enum_payload_slot_ty(&enum_def, Some(&mapping))?;
 
-                        let args_str: Vec<String> = args
-                            .iter()
-                            .map(|a| {
-                                let lowered = self.lower_type_str(a)?;
-                                Ok(lowered
-                                    .replace("!", "")
-                                    .replace("<", "_")
-                                    .replace(">", "_")
-                                    .replace(" ", "_")
-                                    .replace(",", "_")
-                                    .replace("\"", "")
-                                    .replace("(", "_")
-                                    .replace(")", "_")
-                                    .replace(".", "_"))
-                            })
-                            .collect::<Result<Vec<_>, LowerError>>()?;
+                        let args_str = self.type_args_name(args)?;
 
                         format!(
                             "!llvm.struct<\"{}_{}\", (i32, {})>",
-                            name,
-                            args_str.join("_"),
-                            payload_ty_str
+                            name, args_str, payload_ty_str
                         )
                     } else {
                         return Err(LowerError::from(format!(
@@ -1992,48 +1954,14 @@ impl<'c> MeliorGenerator<'c> {
                 )));
             }
             syntax::Type::Simd(el_ty, n) => {
-                let ty_str = match el_ty {
-                    ElementType::F16 => "f16",
-                    ElementType::F32 => "f32",
-                    ElementType::F64 => "f64",
-                    ElementType::BF16 => "bf16",
-                    ElementType::I4 | ElementType::U4 => "i4",
-                    ElementType::I8 | ElementType::U8 => "i8",
-                    ElementType::I16 | ElementType::U16 => "i16",
-                    ElementType::I32 | ElementType::U32 => "i32",
-                    ElementType::I64 | ElementType::U64 | ElementType::USize => "i64",
-                    ElementType::I128 | ElementType::U128 => "i128",
-                    ElementType::Bool => "i1",
-                    ElementType::F8E4M3 | ElementType::F8E5M2 | ElementType::F4E2M1 => {
-                        return Err(LowerError::from(
-                            "sub-8-bit float element types are capacity/declaration-only; \
-                             their codegen is not implemented"
-                                .to_string(),
-                        ));
-                    }
-                    ElementType::Generic(_) => {
-                        return Err(LowerError::from(
-                            "internal: generic element type reached codegen (monomorphization \
-                             should have instantiated it)"
-                                .to_string(),
-                        ));
-                    }
-                };
-                format!("vector<{}x{}>", n, ty_str)
+                format!("vector<{}x{}>", n, element_mlir(el_ty)?)
             }
             syntax::Type::Enum(name, _) => {
                 if let Some(enum_def) = self.enums.get(name) {
                     // Any instantiated generic enum, and whichever of its variants carries
                     // the payload -- not a type called `Option` with a variant called `Some`.
                     if name.contains('<') {
-                        let payload_ty_str = self.enum_payload_slot_ty(enum_def, None)?;
-                        return Type::parse(
-                            self.context,
-                            &format!("!llvm.struct<\"{}\", (i32, {})>", name, payload_ty_str),
-                        )
-                        .ok_or_else(|| {
-                            LowerError::from("failed to parse Option enum layout".to_string())
-                        });
+                        return self.generic_enum_type(name, enum_def);
                     }
                 }
                 "i32".to_string()
@@ -2090,33 +2018,7 @@ impl<'c> MeliorGenerator<'c> {
         dims: &[syntax::Dim],
         top: &Option<syntax::Placement>,
     ) -> Result<Type<'c>, crate::codegen::lower::LowerError> {
-        let ty_str = match el_ty {
-            ElementType::F16 => "f16",
-            ElementType::F32 => "f32",
-            ElementType::F64 => "f64",
-            ElementType::BF16 => "bf16",
-            ElementType::I4 | ElementType::U4 => "i4",
-            ElementType::I8 | ElementType::U8 => "i8",
-            ElementType::I16 | ElementType::U16 => "i16",
-            ElementType::I32 | ElementType::U32 => "i32",
-            ElementType::I64 | ElementType::U64 | ElementType::USize => "i64",
-            ElementType::I128 | ElementType::U128 => "i128",
-            ElementType::Bool => "i1",
-            ElementType::F8E4M3 | ElementType::F8E5M2 | ElementType::F4E2M1 => {
-                return Err(LowerError::from(
-                    "sub-8-bit float element types are capacity/declaration-only; \
-                     their codegen is not implemented"
-                        .to_string(),
-                ));
-            }
-            ElementType::Generic(_) => {
-                return Err(LowerError::from(
-                    "internal: generic element type reached codegen (monomorphization \
-                     should have instantiated it)"
-                        .to_string(),
-                ));
-            }
-        };
+        let ty_str = element_mlir(el_ty)?;
 
         // Rank is the list's length: `Tensor<f32, []>` is `memref<f32>`, and a `?` dimension
         // is a `?` in the memref, so a rank-1 dynamic tensor is `memref<?xf32>` and not the
@@ -2447,4 +2349,19 @@ pub(crate) fn tensor_field_rank(ty: &syntax::Type) -> Option<usize> {
         syntax::Type::Tensor(_, dims, _) => Some(dims.len()),
         _ => None,
     }
+}
+
+/// The MLIR name of an element type, with an error for the ones codegen cannot lower.
+fn element_mlir(el_ty: &ElementType) -> Result<&'static str, LowerError> {
+    if let Some(name) = crate::mlir_ty::mlir_scalar(el_ty) {
+        return Ok(name);
+    }
+    Err(LowerError::from(match el_ty {
+        ElementType::Generic(_) => "internal: generic element type reached codegen \
+                                    (monomorphization should have instantiated it)"
+            .to_string(),
+        _ => "sub-8-bit float element types are capacity/declaration-only; \
+              their codegen is not implemented"
+            .to_string(),
+    }))
 }
