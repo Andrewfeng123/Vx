@@ -477,6 +477,24 @@ impl std::fmt::Display for Topology {
     }
 }
 
+impl TopologyKind {
+    /// TopologyKind from name string, single source of truth. Names not recognized as built in become TopologyKind::Custom.
+    pub fn from_name(name: &str) -> TopologyKind {
+        match name {
+            "CPU" => TopologyKind::CPU,
+            "NPU" => TopologyKind::NPU,
+            "AccCore" => TopologyKind::AccCore,
+            "AMX" => TopologyKind::AMX,
+            "ANE" => TopologyKind::ANE,
+            "GPU" => TopologyKind::GPU,
+            "CpuAvx512" | "CPU_AVX512" => TopologyKind::CpuAvx512,
+            "CpuNeon" | "CPU_Neon" => TopologyKind::CpuNeon,
+            "Current" => TopologyKind::Current,
+            other => TopologyKind::Custom(crate::symbol::Symbol::from(other)),
+        }
+    }
+}
+
 impl Topology {
     /// `Topology::gpu(0)[index]`.
     ///
