@@ -161,7 +161,7 @@ Raised by the borrow checker and the linear-type rules. These rule out use-after
 | [`E4010`](/errors/E4010/) | A change to a variable declared without `mut`: assigning it, or a field or element of it, borrowing it `&mut`, or calling a method that takes `&mut self` on it. Declare it `let mut x`, or for a parameter `mut x : T`. |
 | [`E4011`](/errors/E4011/) | A view of a tensor (a row `q[i]` or a field `h.t`) used where a tensor of its own is held: stored in a variable that already exists (`t = q[i]`) or a struct field (`h.t = q[i]`, `Holder { t : q[i] }`), or passed to a function that takes the tensor by value (`f(q[i])`). A view shares its owner's memory and is not a copy. Bind it to a new variable with `let`, pass `q[i].clone()`, or take the parameter by reference. |
 | [`E4012`](/errors/E4012/) | A call to the `drop` method of a `Drop` impl by hand: `x.drop()`. `drop` runs when the value is dropped, so calling it as well would run it twice. Write `drop(x)`, from `core::mem`, to drop a value early. |
-| [`E4013`](/errors/E4013/) | A field moved out of a struct by value: `let x = p.a`, where `p.a` is a struct or enum that is not `Copy`. `p` still owns the field and drops it, so the moved value would be dropped twice. Clone the field (`p.a.clone()`) or borrow it (`&p.a`). |
+| [`E4013`](/errors/E4013/) | A field moved out of a value that must keep it: `let x = p.a` where `p`'s type implements `Drop`, whose `drop` needs every field, or `let x = make().a`, where the value has no name and drops all its fields at the end of the statement. Borrow the field (`&p.a`), clone it, or bind the value to a variable first. |
 
 ## Safety Errors
 
