@@ -6908,6 +6908,7 @@ fn parallel_pure_call(name: &str) -> bool {
         && matches!(
             method,
             "exp"
+                | "fast_exp"
                 | "exp2"
                 | "sqrt"
                 | "abs"
@@ -6918,6 +6919,7 @@ fn parallel_pure_call(name: &str) -> bool {
                 | "cos"
                 | "tan"
                 | "tanh"
+                | "fast_tanh"
                 | "floor"
                 | "ceil"
                 | "round"
