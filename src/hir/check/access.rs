@@ -838,6 +838,96 @@ impl<'a> TypeChecker<'a> {
         None
     }
 
+    /// `t[i]` where the compiler knows both the extent of `t`'s first axis and the largest
+    /// value `i` can take: an index past the end is an error. This holds for a row too, so
+    /// `t[0][j]` cannot reach into the next row.
+    fn check_tensor_index_in_range(
+        &mut self,
+        dims: &[crate::syntax::types::Dim],
+        idx: &Expr,
+        ix_span: &crate::syntax::Span,
+    ) {
+        if self.speculating || !self.mono.closure_captures_stack.is_empty() {
+            return;
+        }
+        let env = self.consteval_snapshot();
+        let Some(Value::Int(extent)) = dims
+            .first()
+            .and_then(|d| d.as_static())
+            .and_then(|e| self.eval_expr(e, &env))
+        else {
+            return;
+        };
+        let Some(largest) = self.largest_index_value(idx, &env) else {
+            return;
+        };
+        if largest >= extent || largest < 0 {
+            let constant = matches!(self.eval_expr(idx, &env), Some(Value::Int(_)));
+            let message = match idx {
+                Expr::Identifier(id) if !constant => format!(
+                    "index `{}` can be {largest}, which is out of range: this dimension has \
+                     {extent} elements",
+                    id.name
+                ),
+                _ => {
+                    format!("index {largest} is out of range: this dimension has {extent} elements")
+                }
+            };
+            self.errors.error_with_code(
+                crate::diagnostic::DiagnosticCode::E8003,
+                message,
+                Some(crate::diagnostic::SourceSpan::from_ast_span(ix_span)),
+            );
+        }
+    }
+
+    /// The largest value an index can take, when the compiler knows it: a constant, or a
+    /// variable with a known upper limit, such as the variable of `for j in 0..6`. `None` for
+    /// a variable that can take no value at all, such as that of `for j in 0..0`, since the
+    /// code that indexes with it never runs.
+    fn largest_index_value(
+        &self,
+        idx: &Expr,
+        env: &HashMap<crate::symbol::Symbol, Value>,
+    ) -> Option<i64> {
+        if let Some(Value::Int(i)) = self.eval_expr(idx, env) {
+            return Some(i);
+        }
+        let Expr::Identifier(id) = idx else {
+            return None;
+        };
+        let (mut lo, mut hi) = (None::<i64>, None::<i64>);
+        for c in &self.consteval.constraints {
+            let Expr::RelationalOp(r) = c else { continue };
+            let Expr::Identifier(l) = &*r.lhs else {
+                continue;
+            };
+            if l.name != id.name {
+                continue;
+            }
+            let Some(Value::Int(v)) = self.eval_expr(&r.rhs, env) else {
+                continue;
+            };
+            let (low, high) = match r.op {
+                RelationalOp::Lt => (None, Some(v - 1)),
+                RelationalOp::Le => (None, Some(v)),
+                RelationalOp::Eq => (Some(v), Some(v)),
+                RelationalOp::Ge => (Some(v), None),
+                RelationalOp::Gt => (Some(v + 1), None),
+                _ => (None, None),
+            };
+            lo = lo.max(low);
+            hi = match (hi, high) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+        }
+        match (lo, hi) {
+            (Some(lo), Some(hi)) if lo > hi => None,
+            (_, hi) => hi,
+        }
+    }
+
     pub(crate) fn check_indexaccess_expr(&mut self, expr: &mut Expr, consume: bool) -> Type {
         // `a[i]` on a struct or an enum whose type implements `Index` reads `*a.index(i)`, and
         // a write, `a[i] = x`, goes through `*a.index_mut(i)`, as in Rust.
@@ -1014,6 +1104,9 @@ impl<'a> TypeChecker<'a> {
                     Type::Borrow { inner, .. } => *inner,
                     other => other,
                 };
+                if let Type::Tensor(_, dims, _) = &base {
+                    self.check_tensor_index_in_range(dims, idx, &ix_span);
+                }
                 if let Type::Pointer(..) = &base {
                     self.require_unsafe_raw_access("Indexing a raw pointer", &ix_span);
                     self.check_pointer_target_is_visible(&base, "Indexing a raw pointer", &ix_span);
