@@ -27,17 +27,39 @@ Memory CHIP_RAM {
   capacity: 1 GB, bandwidth: 1 TB/s
 }
 
-Topology CPU { memory: Memory::CHIP_RAM, transfer Memory::CPU_DRAM -> Memory::CHIP_RAM : 100 }
-Topology Current { memory: Memory::CHIP_RAM, transfer Memory::CPU_DRAM -> Memory::CHIP_RAM : 100 }
-Topology NPU { memory: Memory::CHIP_RAM, transfer Memory::CPU_DRAM -> Memory::CHIP_RAM : 100 }
-Topology AccCore { memory: Memory::CHIP_RAM, transfer Memory::CPU_DRAM -> Memory::CHIP_RAM : 100 }
-Topology AMX { memory: Memory::CHIP_RAM, transfer Memory::CPU_DRAM -> Memory::CHIP_RAM : 100 }
-Topology ANE { memory: Memory::CHIP_RAM, transfer Memory::CPU_DRAM -> Memory::CHIP_RAM : 100 }
-Topology GPU { memory: Memory::CHIP_RAM, transfer Memory::CPU_DRAM -> Memory::CHIP_RAM : 100 }
-Topology CpuAvx512 { memory: Memory::CHIP_RAM, transfer Memory::CPU_DRAM -> Memory::CHIP_RAM : 100 }
-Topology CPU_AVX512 { memory: Memory::CHIP_RAM, transfer Memory::CPU_DRAM -> Memory::CHIP_RAM : 100 }
-Topology CpuNeon { memory: Memory::CHIP_RAM, transfer Memory::CPU_DRAM -> Memory::CHIP_RAM : 100 }
-Topology CPU_Neon { memory: Memory::CHIP_RAM, transfer Memory::CPU_DRAM -> Memory::CHIP_RAM : 100 }
+Topology CPU {
+  memory: Memory::CHIP_RAM, transfer Memory::CPU_DRAM -> Memory::CHIP_RAM : 100
+}
+Topology Current {
+  memory: Memory::CHIP_RAM, transfer Memory::CPU_DRAM -> Memory::CHIP_RAM : 100
+}
+Topology NPU {
+  memory: Memory::CHIP_RAM, transfer Memory::CPU_DRAM -> Memory::CHIP_RAM : 100
+}
+Topology AccCore {
+  memory: Memory::CHIP_RAM, transfer Memory::CPU_DRAM -> Memory::CHIP_RAM : 100
+}
+Topology AMX {
+  memory: Memory::CHIP_RAM, transfer Memory::CPU_DRAM -> Memory::CHIP_RAM : 100
+}
+Topology ANE {
+  memory: Memory::CHIP_RAM, transfer Memory::CPU_DRAM -> Memory::CHIP_RAM : 100
+}
+Topology GPU {
+  memory: Memory::CHIP_RAM, transfer Memory::CPU_DRAM -> Memory::CHIP_RAM : 100
+}
+Topology CpuAvx512 {
+  memory: Memory::CHIP_RAM, transfer Memory::CPU_DRAM -> Memory::CHIP_RAM : 100
+}
+Topology CPU_AVX512 {
+  memory: Memory::CHIP_RAM, transfer Memory::CPU_DRAM -> Memory::CHIP_RAM : 100
+}
+Topology CpuNeon {
+  memory: Memory::CHIP_RAM, transfer Memory::CPU_DRAM -> Memory::CHIP_RAM : 100
+}
+Topology CPU_Neon {
+  memory: Memory::CHIP_RAM, transfer Memory::CPU_DRAM -> Memory::CHIP_RAM : 100
+}
 
 fn main() -> i32 {
   return 0;
