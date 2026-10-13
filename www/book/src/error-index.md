@@ -210,7 +210,7 @@ Raised by the placement and capacity rules — the checks that make Vx different
 | [`E6028`](/errors/E6028/) | A recursive cycle that places tiles in a space with a declared capacity. The recursion depth is not known at compile time, so the true peak is unbounded and the placement is refused conservatively. Downgraded to W1028 when the space is declared `overcommit`. |
 | [`E6029`](/errors/E6029/) | A pointer argument into one memory passed to a parameter that wants a pointer into another: a host `*mut f32` where `*mut f32 in Memory::GPU_HBM` is declared, or the reverse. The two are different types, and the C library or kernel behind the parameter reads the memory the declaration names, so the spaces must match exactly. |
 | [`E6030`](/errors/E6030/) | A `spawn` region on a device hands out a tensor it makes, which the host could not free. The compiler makes such a tensor before the region instead, in the device's memory, when the region hands it out as a variable created with `Tensor<..>(..)`, `::new()` or `::uninit()`, with no type annotation, a size that uses nothing the region computes, and a name nothing outside the region already uses. |
-| [`E6031`](/errors/E6031/) | A tensor shape that folds to a negative extent, or whose size in bytes does not fit in 64 bits. The size is known, and it is not one the generated code can allocate: it would wrap. |
+| [`E6031`](/errors/E6031/) | A tensor shape that folds to a negative extent, or whose size is more than 2^63 - 1 bytes, the most an allocation can ask for. The size is known, and it is not one the generated code can allocate: it would wrap. |
 
 ## Tensor/Math Errors
 

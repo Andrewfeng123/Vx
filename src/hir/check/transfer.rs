@@ -453,7 +453,9 @@ impl<'a> TypeChecker<'a> {
         use crate::hir::memory::StaticSize;
         let why = match crate::hir::memory::static_tensor_size(elem, dims) {
             StaticSize::NegativeExtent => "one of its extents is negative",
-            StaticSize::Overflows => "its size in bytes does not fit in 64 bits",
+            StaticSize::Overflows => {
+                "its size is more than 2^63 - 1 bytes, the most an allocation can ask for"
+            }
             StaticSize::Bytes(_) | StaticSize::NotConstant => return false,
         };
         // The extents as they fold, so `[N - 2 * N]` shows the number it comes to.
